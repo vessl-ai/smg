@@ -30,7 +30,8 @@ pub use file::FileProviderConfig;
 #[cfg(feature = "test-util")]
 pub use kubernetes::start_service_discovery_with_client;
 pub use kubernetes::{
-    ModelIdSource, PodInfo, PodType, ServiceDiscoveryConfig, POD_NAME_LABEL, POD_UID_LABEL,
+    ModelIdSource, PodInfo, PodType, ServiceDiscoveryConfig, DEFAULT_WATCH_TIMEOUT_SECS,
+    POD_NAME_LABEL, POD_UID_LABEL,
 };
 pub use reconciler::{DISCOVERY_ID_LABEL, DISCOVERY_PROVIDER_LABEL, DISCOVERY_SPEC_HASH_LABEL};
 pub use runtime::{start_service_discovery, RuntimeDiscoveryConfig};
