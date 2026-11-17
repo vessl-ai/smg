@@ -27,7 +27,7 @@ use smg_mesh::{
 use tokio::task;
 use tracing::{debug, error, info, warn};
 
-use crate::config::DiscoveryConfig;
+use crate::{config::DiscoveryConfig, service_discovery::DEFAULT_WATCH_TIMEOUT_SECS};
 
 /// Configuration for Kubernetes router-peer discovery.
 #[derive(Debug, Clone)]
@@ -315,7 +315,9 @@ fn run_mesh_discovery(
             Api::all(client)
         };
 
-        let watcher_config = build_watcher_config(&config.label_selector());
+        // Same idle-cut exposure as the worker watch: end each watch early.
+        let watcher_config =
+            build_watcher_config(&config.label_selector()).timeout(DEFAULT_WATCH_TIMEOUT_SECS);
         let mut stream = watcher(pods, watcher_config).default_backoff().boxed();
 
         while let Some(item) = stream.next().await {
