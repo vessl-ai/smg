@@ -36,6 +36,17 @@ use crate::{
 pub const POD_NAME_LABEL: &str = "smg.ai/pod-name";
 pub const POD_UID_LABEL: &str = "smg.ai/pod-uid";
 
+/// Server-side timeout (`timeoutSeconds`) sent with every Pod watch.
+///
+/// Deliberately under one minute. Some paths to the API server silently drop a
+/// connection that has carried no bytes for about 60 s. A watch waiting on
+/// such a connection gets neither an event nor an end of stream, and only
+/// fails at the client's 295 s read timeout; Pod changes made in between reach
+/// discovery at that reconnect. A watch that ends before the idle cut is a
+/// clean end of stream instead, and the watcher resumes from the last
+/// resourceVersion without a re-LIST.
+pub const DEFAULT_WATCH_TIMEOUT_SECS: u32 = 50;
+
 /// Source for per-worker model_id override during Kubernetes service discovery.
 #[derive(Debug, Clone)]
 pub enum ModelIdSource {
@@ -110,6 +121,9 @@ pub struct ServiceDiscoveryConfig {
     pub kv_engine_id_annotation: String,
     /// Per-worker model_id override source from pod metadata.
     pub model_id_source: Option<ModelIdSource>,
+    /// Server-side timeout of each Pod watch, in seconds. See
+    /// [`DEFAULT_WATCH_TIMEOUT_SECS`] for why it stays under a minute.
+    pub watch_timeout_secs: u32,
 }
 
 impl ServiceDiscoveryConfig {
@@ -189,6 +203,7 @@ impl Default for ServiceDiscoveryConfig {
             kv_connector_annotation: "smg.ai/kv-connector".to_string(),
             kv_engine_id_annotation: "smg.ai/kv-engine-id".to_string(),
             model_id_source: None,
+            watch_timeout_secs: DEFAULT_WATCH_TIMEOUT_SECS,
         }
     }
 }
@@ -550,7 +565,8 @@ fn run_service_discovery(
         let (store, writer) = reflector::store::<Pod>();
         let notify = Arc::new(Notify::new());
 
-        let watcher_config = build_watcher_config(&config_arc.list_label_selector());
+        let watcher_config = build_watcher_config(&config_arc.list_label_selector())
+            .timeout(config_arc.watch_timeout_secs);
         // managed_fields dominate pod object size and nothing here reads them;
         // pruning keeps the long-lived Store lean.
         let mut stream = watcher(pods, watcher_config)
@@ -796,6 +812,7 @@ mod tests {
             kv_connector_annotation: "smg.ai/kv-connector".to_string(),
             kv_engine_id_annotation: "smg.ai/kv-engine-id".to_string(),
             model_id_source: None,
+            watch_timeout_secs: DEFAULT_WATCH_TIMEOUT_SECS,
         }
     }
 

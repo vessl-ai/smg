@@ -70,6 +70,7 @@ fn kubernetes_runtime(
         kv_connector_annotation: config.kv_connector_annotation.clone(),
         kv_engine_id_annotation: config.kv_engine_id_annotation.clone(),
         model_id_source,
+        watch_timeout_secs: kubernetes::DEFAULT_WATCH_TIMEOUT_SECS,
     })
 }
 

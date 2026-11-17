@@ -49,6 +49,13 @@ struct FakeState {
     pods: Arc<Mutex<BTreeMap<String, Pod>>>,
     resource_version: Arc<AtomicU64>,
     watch_tx: Arc<Mutex<broadcast::Sender<String>>>,
+    /// When set, a watch connection that has carried no bytes for this long
+    /// is dropped silently: it delivers nothing more and never ends.
+    watch_idle_cut: Arc<Mutex<Option<Duration>>>,
+    /// Watch requests served so far.
+    watches_started: Arc<AtomicU64>,
+    /// `timeoutSeconds` of the most recent watch request (0 = not sent).
+    last_watch_timeout_secs: Arc<AtomicU64>,
 }
 
 /// Minimal pods endpoint: LIST returns the current pod set, WATCH streams
@@ -65,6 +72,9 @@ impl FakeK8s {
             pods: Arc::new(Mutex::new(BTreeMap::new())),
             resource_version: Arc::new(AtomicU64::new(1)),
             watch_tx: Arc::new(Mutex::new(broadcast::channel(64).0)),
+            watch_idle_cut: Arc::new(Mutex::new(None)),
+            watches_started: Arc::new(AtomicU64::new(0)),
+            last_watch_timeout_secs: Arc::new(AtomicU64::new(0)),
         };
         let app = Router::new()
             .route("/api/v1/pods", any(pods_handler))
@@ -135,6 +145,32 @@ impl FakeK8s {
         }
     }
 
+    /// Model a network path that silently drops a watch connection once it
+    /// has carried no bytes for `idle`: no further event reaches the client
+    /// and the stream never ends, so only the client's read timeout notices.
+    fn cut_idle_watches_after(&self, idle: Duration) {
+        *self.state.watch_idle_cut.lock().unwrap() = Some(idle);
+    }
+
+    fn watches_started(&self) -> u64 {
+        self.state.watches_started.load(Ordering::SeqCst)
+    }
+
+    /// Returns once a watch newer than every watch seen so far is subscribed,
+    /// so an event sent right after lands on a stream with its whole
+    /// server-side timeout still ahead of it.
+    async fn await_new_watch(&self) {
+        let seen = self.watches_started();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while self.watches_started() == seen {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no new watch arrived; watches so far: {seen}"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
     /// Expire every open watch: send a 410 Gone ERROR event (the "too old
     /// resource version" desync) and end the streams, forcing a re-LIST.
     fn expire_watch(&self) {
@@ -168,16 +204,66 @@ impl FakeK8s {
     }
 }
 
+/// One open watch response on the fake API server.
+struct WatchStream {
+    rx: broadcast::Receiver<String>,
+    /// Server-side `timeoutSeconds` deadline, when the request carried one.
+    ends_at: Option<tokio::time::Instant>,
+    idle_cut: Option<Duration>,
+    last_byte_at: tokio::time::Instant,
+}
+
+async fn sleep_until_or_never(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
+}
+
 async fn pods_handler(State(state): State<FakeState>, RawQuery(query): RawQuery) -> Response {
     let query = query.unwrap_or_default();
     if query.contains("watch=true") {
-        let rx = state.watch_tx.lock().unwrap().subscribe();
-        let stream = futures::stream::unfold(rx, |mut rx| async move {
+        // Like the API server, end the watch cleanly once `timeoutSeconds`
+        // has passed, whether or not anything was sent.
+        let timeout_secs = query
+            .split('&')
+            .find_map(|pair| pair.strip_prefix("timeoutSeconds="))
+            .and_then(|secs| secs.parse::<u64>().ok());
+        let now = tokio::time::Instant::now();
+        let watch = WatchStream {
+            rx: state.watch_tx.lock().unwrap().subscribe(),
+            ends_at: timeout_secs.map(|secs| now + Duration::from_secs(secs)),
+            idle_cut: *state.watch_idle_cut.lock().unwrap(),
+            last_byte_at: now,
+        };
+        state
+            .last_watch_timeout_secs
+            .store(timeout_secs.unwrap_or(0), Ordering::SeqCst);
+        // Counted only after subscribing: a test that sees the count move can
+        // send an event knowing this stream receives it.
+        state.watches_started.fetch_add(1, Ordering::SeqCst);
+        let stream = futures::stream::unfold(watch, |mut watch| async move {
             loop {
-                match rx.recv().await {
-                    Ok(line) => return Some((Ok::<Bytes, Infallible>(Bytes::from(line)), rx)),
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(broadcast::error::RecvError::Closed) => return None,
+                let idle_cut_at = watch.idle_cut.map(|idle| watch.last_byte_at + idle);
+                tokio::select! {
+                    // The clean end is polled first: a watch whose timeout is
+                    // shorter than the idle cut must never count as cut, even
+                    // when this task wakes late.
+                    biased;
+                    () = sleep_until_or_never(watch.ends_at) => return None,
+                    () = sleep_until_or_never(idle_cut_at) => {
+                        // Dropped by the path: the client hears nothing more,
+                        // not even the end of the stream.
+                        std::future::pending::<()>().await;
+                    }
+                    received = watch.rx.recv() => match received {
+                        Ok(line) => {
+                            watch.last_byte_at = tokio::time::Instant::now();
+                            return Some((Ok::<Bytes, Infallible>(Bytes::from(line)), watch));
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(broadcast::error::RecvError::Closed) => return None,
+                    },
                 }
             }
         });
@@ -917,6 +1003,112 @@ async fn severed_watch_reconnects_and_converges_without_relist() {
         |urls| !has_url(urls, port),
     )
     .await;
+
+    handle.abort();
+}
+
+/// How long the fake path lets a watch connection stay quiet before it drops
+/// it silently, and how long the scenarios below stay quiet before a Pod
+/// turns up. Both stand in for the real figures (about 60 s, and minutes).
+const IDLE_CUT: Duration = Duration::from_secs(3);
+const QUIET_PERIOD: Duration = Duration::from_secs(7);
+
+#[tokio::test]
+async fn watch_shorter_than_the_idle_cut_still_delivers_after_a_quiet_period() {
+    let fake = FakeK8s::start().await;
+    fake.cut_idle_watches_after(IDLE_CUT);
+    let app_context = test_context().await;
+    let (_engine, port) = start_mock_engine().await;
+
+    let handle = start_service_discovery_with_client(
+        fake.client(),
+        ServiceDiscoveryConfig {
+            watch_timeout_secs: 1,
+            ..discovery_config()
+        },
+        Arc::clone(&app_context),
+    );
+
+    // Nothing changes for longer than the idle cut. Each watch ends at its
+    // own timeout first and is replaced, so no connection is ever cut.
+    tokio::time::sleep(QUIET_PERIOD).await;
+    assert_eq!(
+        fake.state.last_watch_timeout_secs.load(Ordering::SeqCst),
+        1,
+        "the watch request must carry the configured timeoutSeconds"
+    );
+    assert!(
+        fake.watches_started() >= 4,
+        "a 1s watch must have been renewed through a {QUIET_PERIOD:?} quiet period; watches: {}",
+        fake.watches_started()
+    );
+
+    fake.await_new_watch().await;
+    fake.apply_pod(worker_pod(
+        "quiet-0",
+        "uid-quiet-0",
+        &port.to_string(),
+        true,
+    ));
+    wait_for(
+        &app_context,
+        "worker registered after a quiet period",
+        Duration::from_secs(10),
+        |urls| has_url(urls, port),
+    )
+    .await;
+
+    // Removal travels the same watch.
+    fake.await_new_watch().await;
+    fake.delete_pod("quiet-0");
+    wait_for(
+        &app_context,
+        "worker removed after a quiet period",
+        Duration::from_secs(10),
+        |urls| !has_url(urls, port),
+    )
+    .await;
+
+    handle.abort();
+}
+
+/// Control for the scenario above: it shows the idle cut is what the short
+/// timeout avoids. A watch that outlives the cut hears nothing afterwards, and
+/// the client's read timeout (295 s) is all that would ever end it.
+#[tokio::test]
+async fn watch_longer_than_the_idle_cut_goes_deaf() {
+    let fake = FakeK8s::start().await;
+    fake.cut_idle_watches_after(IDLE_CUT);
+    let app_context = test_context().await;
+    let (_engine, port) = start_mock_engine().await;
+
+    let handle = start_service_discovery_with_client(
+        fake.client(),
+        ServiceDiscoveryConfig {
+            watch_timeout_secs: 290,
+            ..discovery_config()
+        },
+        Arc::clone(&app_context),
+    );
+
+    tokio::time::sleep(QUIET_PERIOD).await;
+    assert_eq!(
+        fake.watches_started(),
+        1,
+        "the one long watch is still the client's only stream"
+    );
+
+    fake.apply_pod(worker_pod("deaf-0", "uid-deaf-0", &port.to_string(), true));
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert!(
+        !has_url(&app_context.worker_registry.get_all_urls(), port),
+        "a watch cut by the path cannot have delivered the Pod"
+    );
+    assert_eq!(
+        fake.watches_started(),
+        1,
+        "nothing told the client to renew"
+    );
 
     handle.abort();
 }
