@@ -84,7 +84,12 @@ jobs:
       - name: Validate PR title format
         env:
           PR_TITLE: ${{ github.event.pull_request.title }}
+          HEAD_BRANCH: ${{ github.head_ref }}
         run: |
+          if [[ "$HEAD_BRANCH" == sync/?* && "$PR_TITLE" == "Merge upstream release ${HEAD_BRANCH#sync/}" ]]; then
+            exit 0
+          fi
+
           REGEX='^(feat|fix|chore|docs|refactor|test|ci|perf|lint|style|revert|build)(\([a-z0-9_./-]+\))?!?: .+'
 
           if [[ ! "$PR_TITLE" =~ $REGEX ]]; then
